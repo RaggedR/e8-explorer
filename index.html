@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>E8 Explorer</title>
+<style>
+  :root {
+    --bg:#f4f1ea; --panel:rgba(255,255,255,.74); --ink:#1a1a1a;
+    --muted:#5a5750; --line:rgba(0,0,0,.12);
+    --edge:40,40,70; --incident:200,120,0; --orbit:0,120,180;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#07080c; --panel:rgba(18,20,28,.74); --ink:#f2f0ea;
+      --muted:#9aa0b0; --line:rgba(255,255,255,.14);
+      --edge:150,175,255; --incident:255,185,70; --orbit:120,230,255;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#07080c; --panel:rgba(18,20,28,.74); --ink:#f2f0ea;
+    --muted:#9aa0b0; --line:rgba(255,255,255,.14);
+    --edge:150,175,255; --incident:255,185,70; --orbit:120,230,255;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body { background:var(--bg); color:var(--ink);
+    font:14px/1.5 system-ui,-apple-system,sans-serif; overflow:hidden;
+    -webkit-font-smoothing:antialiased; }
+  #stage { position:fixed; inset:0; display:block; touch-action:none; cursor:grab; }
+  #stage.dragging { cursor:grabbing; }
+
+  header { position:fixed; top:0; left:0; padding:16px 18px; z-index:3; max-width:min(44ch,92vw); }
+  h1 { margin:0 0 2px; font-family:Georgia,serif; font-weight:600;
+    font-size:clamp(18px,2.6vw,26px); }
+  .cap { color:var(--muted); font-size:12px; margin:0 0 10px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:11px;
+    backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); }
+  .row { display:flex; gap:4px; flex-wrap:wrap; padding:5px; margin-bottom:6px; }
+  button { font:inherit; font-size:12px; color:var(--ink); background:transparent;
+    border:1px solid var(--line); padding:6px 10px; border-radius:7px; cursor:pointer;
+    white-space:nowrap; transition:border-color .15s, background .15s; }
+  button:hover { border-color:var(--ink); }
+  button.on { background:var(--ink); color:var(--bg); border-color:var(--ink); }
+  #graphrow button { font-size:11px; }
+
+  #controls { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:4;
+    display:flex; gap:8px; padding:8px 10px; }
+  #readout { position:fixed; right:16px; top:16px; padding:10px 12px; font-size:12px;
+    color:var(--muted); line-height:1.7; text-align:right; z-index:4; max-width:40vw; }
+  #readout b { color:var(--ink); font-weight:600; }
+  #hint { margin-top:6px; font-size:11px; opacity:.85; }
+  @media (max-width:640px){ #readout{ display:none; } }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<header>
+  <h1 id="title">E6 — Schläfli</h1>
+  <p class="cap" id="cap"></p>
+  <div class="panel" id="rungrow"></div>
+  <div class="panel" id="graphrow"></div>
+</header>
+
+<div class="panel" id="readout">
+  <div id="counts"></div>
+  <div id="hint">click a vertex → click a bold edge → orbit</div>
+</div>
+
+<div class="panel" id="controls">
+  <button id="zoomout">&ndash;</button>
+  <button id="zoomin">+</button>
+  <button id="reset">Reset view</button>
+  <button id="theme">Light / Dark</button>
+</div>
+
+<script src="ladder_data.js"></script>
+<script>
+(() => {
+  const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+
+  // ---- geometry + graph state ----
+  let rungIdx = 2, graphIdx = 0;                 // default E6 Schläfli (set below)
+  let RG, GG, N, nRings, RR, ringR, sx, sy, adj;
+  let zoom = 1, panX = 0, panY = 0;
+  let selVerts = new Set();                      // multi-select vertices
+  let selOrbits = new Map();                     // canonicalKey -> [[i,j],...]
+  let W, H, cx, cy, baseScale, dpr, dirty = true;
+
+  const ringColor = (r) => `hsl(${20 + r * (238 / Math.max(1, nRings - 1))},85%,62%)`;
+  const ekey = (a, b) => (a < b ? a * 100000 + b : b * 100000 + a);
+
+  function orbitOf(a0, b0) {               // Coxeter-rotation orbit of an edge
+    const h = RG.coxeterNumber, p = RG.perm, seen = new Set(), orb = [];
+    let a = a0, b = b0;
+    for (let s = 0; s < h; s++) {
+      const k = ekey(a, b);
+      if (seen.has(k)) break;
+      seen.add(k); orb.push([a, b]);
+      a = p[a]; b = p[b];
+    }
+    return orb;
+  }
+  const canon = (orb) => Math.min(...orb.map(([a, b]) => ekey(a, b)));
+
+  function loadGraph() {
+    RG = RUNGS[rungIdx]; GG = RG.graphs[graphIdx];
+    N = RG.n; nRings = RG.numRings; RR = RG.ringRadii;
+    ringR = Float32Array.from(RR);                 // current (draggable) radius per ring
+    adj = Array.from({ length: N }, () => []);
+    for (const [i, j] of GG.edges) { adj[i].push(j); adj[j].push(i); }
+    sx = new Float32Array(N); sy = new Float32Array(N);
+    selOrbits.clear();                           // graph changed: drop edge highlights
+    buildChrome(); dirty = true;
+  }
+  function switchRung(ix) {
+    rungIdx = ix; graphIdx = 0; selVerts.clear(); morph = 0; loadGraph();
+  }
+
+  function buildChrome() {
+    const rr = document.getElementById('rungrow'); rr.className = 'panel row'; rr.innerHTML = '';
+    RUNGS.forEach((R, i) => {
+      const b = document.createElement('button');
+      b.textContent = R.name; b.classList.toggle('on', i === rungIdx);
+      b.onclick = () => switchRung(i); rr.appendChild(b);
+    });
+    const gr = document.getElementById('graphrow'); gr.className = 'panel row'; gr.innerHTML = '';
+    RG.graphs.forEach((g, i) => {
+      const b = document.createElement('button');
+      b.textContent = g.label.replace(/ SRG.*| \(.*/, '').trim() || g.label;
+      b.title = g.label; b.classList.toggle('on', i === graphIdx);
+      b.onclick = () => { graphIdx = i; selVerts.clear(); loadGraph(); }; gr.appendChild(b);
+    });
+    document.getElementById('title').textContent = `${RG.name} — ` +
+      GG.label.replace(/ SRG.*| \(.*/, '').trim();
+    document.getElementById('cap').textContent = GG.label;
+    document.getElementById('counts').innerHTML =
+      `<b>${N}</b> vertices &nbsp; <b>${GG.edges.length}</b> edges<br>` +
+      `${GG.valency}-regular &nbsp; h = <b>${RG.coxeterNumber}</b>`;
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + 'px'; cv.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx = W / 2; cy = H / 2; baseScale = 0.4 * Math.min(W, H); dirty = true;
+  }
+  addEventListener('resize', resize);
+
+  function project() {
+    const s = zoom * baseScale;
+    for (let k = 0; k < N; k++) {
+      const ring = RG.points[k][2], orig = RR[ring];
+      const f = orig > 1e-6 ? ringR[ring] / orig : 1;   // scale a ring's radius; centre stays
+      sx[k] = cx + panX + s * RG.points[k][0] * f;
+      sy[k] = cy + panY + s * RG.points[k][1] * f;
+    }
+  }
+  const isDark = () => {
+    const a = document.documentElement.getAttribute('data-theme');
+    return a ? a === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  };
+
+  function strokeEdges(list, rgb, alpha, w) {
+    if (!list.length) return;
+    ctx.lineWidth = w; ctx.strokeStyle = `rgba(${rgb},${alpha})`; ctx.beginPath();
+    for (const [i, j] of list) { ctx.moveTo(sx[i], sy[i]); ctx.lineTo(sx[j], sy[j]); }
+    ctx.stroke();
+  }
+  function cssvar(n) { return getComputedStyle(document.body).getPropertyValue(n).trim(); }
+
+  function draw() {
+    if (!GG) return;                      // not initialised yet (loop may start first)
+    project(); ctx.clearRect(0, 0, W, H);
+    const EDGE = cssvar('--edge'), INC = cssvar('--incident'), ORB = cssvar('--orbit');
+    const anySel = selVerts.size || selOrbits.size;
+
+    strokeEdges(GG.edges, EDGE, anySel ? 0.12 : 0.28, 1);        // base
+    // incident (grabbable) edges of selected vertices
+    const inc = [];
+    for (const v of selVerts) for (const u of adj[v]) inc.push([v, u]);
+    strokeEdges(inc, INC, 0.85, 1.7);
+    // selected edge orbits
+    for (const orb of selOrbits.values()) strokeEdges(orb, ORB, 0.95, 2.2);
+
+    for (let k = 0; k < N; k++) {
+      ctx.beginPath(); ctx.fillStyle = ringColor(RG.points[k][2]);
+      ctx.arc(sx[k], sy[k], 3.3, 0, 6.2832); ctx.fill();
+    }
+    const dk = isDark();
+    for (const v of selVerts) {
+      ctx.beginPath(); ctx.fillStyle = dk ? '#fff' : '#000';
+      ctx.arc(sx[v], sy[v], 5.6, 0, 6.2832); ctx.fill();
+    }
+  }
+  (function loop(){ if (dirty) { draw(); dirty = false; } requestAnimationFrame(loop); })();
+
+  // ---- hit testing ----
+  function nearestVertex(mx, my, rad) {
+    let best = -1, bd = rad * rad;
+    for (let k = 0; k < N; k++) {
+      const dx = mx - sx[k], dy = my - sy[k], d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = k; }
+    }
+    return best;
+  }
+  function segDist(px, py, a, b) {
+    const ax = sx[a], ay = sy[a], bx = sx[b], by = sy[b];
+    const dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy || 1;
+    let t = ((px - ax) * dx + (py - ay) * dy) / L2; t = Math.max(0, Math.min(1, t));
+    const qx = ax + t * dx, qy = ay + t * dy;
+    return Math.hypot(px - qx, py - qy);
+  }
+  // only BOLD edges are clickable (incident to a selected vertex, or already highlighted)
+  function nearestBoldEdge(mx, my, rad) {
+    let best = null, bd = rad, kind = null, okey = null;
+    for (const [okeyv, orb] of selOrbits)
+      for (const [i, j] of orb) {
+        const d = segDist(mx, my, i, j);
+        if (d < bd) { bd = d; best = [i, j]; kind = 'orbit'; okey = okeyv; }
+      }
+    for (const v of selVerts) for (const u of adj[v]) {
+      const d = segDist(mx, my, v, u);
+      if (d < bd) { bd = d; best = [v, u]; kind = 'incident'; okey = null; }
+    }
+    return best ? { edge: best, kind, okey } : null;
+  }
+
+  function onClick(mx, my) {
+    const v = nearestVertex(mx, my, 11);
+    if (v >= 0) {                                    // toggle vertex
+      selVerts.has(v) ? selVerts.delete(v) : selVerts.add(v);
+      setHint(`vertex ${v} · ${adj[v].length} edges · ${selVerts.size} selected`);
+      dirty = true; return;
+    }
+    const e = nearestBoldEdge(mx, my, 7);
+    if (e) {
+      if (e.kind === 'orbit') { selOrbits.delete(e.okey); setHint('orbit off'); }
+      else {
+        const orb = orbitOf(e.edge[0], e.edge[1]);
+        selOrbits.set(canon(orb), orb);
+        for (const w of e.edge) selVerts.delete(w);   // drop the handle vertex once the edge is taken
+        setHint(`edge orbit · ${orb.length} rotations (one edge, turned by the Coxeter element)`);
+      }
+      dirty = true; return;
+    }
+    selVerts.clear(); selOrbits.clear(); setHint('cleared'); dirty = true;  // empty space
+  }
+  const setHint = (t) => document.getElementById('hint').textContent = t;
+
+  // ---- pointer: click=select, drag-from-centre=evert, drag-else=pan, wheel=zoom ----
+  // drag on a vertex = pull that ring in/out; drag empty space = zoom about centre
+  let down = false, moved = false, x0, y0, z0, grabRing = -1;
+  cv.addEventListener('pointerdown', (ev) => {
+    down = true; moved = false; x0 = ev.clientX; y0 = ev.clientY; z0 = zoom;
+    const v = nearestVertex(ev.clientX, ev.clientY, 11);
+    grabRing = (v >= 0 && RR[RG.points[v][2]] > 1e-6) ? RG.points[v][2] : -1;  // non-central ring
+    cv.setPointerCapture(ev.pointerId);
+  });
+  cv.addEventListener('pointermove', (ev) => {
+    if (!down) return;
+    if (!moved && Math.hypot(ev.clientX - x0, ev.clientY - y0) > 5) { moved = true; cv.classList.add('dragging'); }
+    if (!moved) return;
+    if (grabRing >= 0) {                             // drag the grabbed ring to a new radius
+      const r = Math.hypot(ev.clientX - (cx + panX), ev.clientY - (cy + panY)) / (zoom * baseScale);
+      ringR[grabRing] = Math.max(0, Math.min(3, r));
+    } else {
+      zoom = Math.max(0.3, Math.min(80, z0 * Math.exp(-(ev.clientY - y0) * 0.007)));
+    }
+    dirty = true;
+  });
+  cv.addEventListener('pointerup', (ev) => {
+    if (down && !moved) onClick(ev.clientX, ev.clientY);
+    down = false; cv.classList.remove('dragging');
+  });
+  cv.addEventListener('pointercancel', () => { down = false; cv.classList.remove('dragging'); });
+  cv.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    zoom = Math.max(0.3, Math.min(80, zoom * Math.exp(-ev.deltaY * 0.0015)));
+    dirty = true;                                   // zoom about the centre
+  }, { passive: false });
+
+  // ---- buttons ----
+  function zoomBy(f) { const nz = Math.max(0.3, Math.min(80, zoom * f)), g = nz / zoom;
+    panX *= g; panY *= g; zoom = nz; dirty = true; }     // anchored on viewport centre
+  document.getElementById('zoomin').onclick = () => zoomBy(1.3);
+  document.getElementById('zoomout').onclick = () => zoomBy(1 / 1.3);
+  document.getElementById('reset').onclick = () => {
+    zoom = 1; panX = panY = 0; ringR = Float32Array.from(RR); dirty = true;   // rings back home too
+  };
+  document.getElementById('theme').onclick = () => {
+    const cur = document.documentElement.getAttribute('data-theme');
+    document.documentElement.setAttribute('data-theme', (cur ? cur === 'dark' : isDark()) ? 'light' : 'dark');
+    dirty = true;
+  };
+
+  // default: E6 Schläfli (the ip=0, 10-regular graph)
+  rungIdx = RUNGS.findIndex(r => r.name === 'E6');
+  graphIdx = Math.max(0, RUNGS[rungIdx].graphs.findIndex(g => g.valency === 10));
+  resize(); loadGraph();
+})();
+</script>
+</body>
+</html>
